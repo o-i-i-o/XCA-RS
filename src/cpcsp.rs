@@ -328,10 +328,6 @@ pub(crate) fn engine_digest_n(name: &[u8], data: &[u8], out_len: usize) -> Resul
             properties: *const std::ffi::c_char,
         ) -> *mut openssl_sys::EVP_MD;
         fn EVP_get_digestbyname(name: *const std::ffi::c_char) -> *const openssl_sys::EVP_MD;
-        fn ENGINE_get_digest(
-            e: *const openssl_sys::ENGINE,
-            nid: std::ffi::c_int,
-        ) -> *const openssl_sys::EVP_MD;
         fn OBJ_txt2nid(s: *const std::ffi::c_char) -> std::ffi::c_int;
     }
     let name = std::ffi::CString::new(name.to_vec()).map_err(|e| e.to_string())?;
@@ -360,8 +356,8 @@ pub(crate) fn engine_digest_n(name: &[u8], data: &[u8], out_len: usize) -> Resul
             let mut md = EVP_get_digestbyname(name.as_ptr());
             if md.is_null() {
                 let nid = OBJ_txt2nid(c"1.2.643.2.2.9".as_ptr());
-                md = ENGINE_get_digest(
-                    crypto::gost_engine_ptr() as *const openssl_sys::ENGINE,
+                md = crypto::gost_engine_digest(
+                    crypto::gost_engine_ptr(),
                     nid,
                 );
             }

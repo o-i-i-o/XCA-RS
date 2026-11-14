@@ -34,14 +34,11 @@ mod gost_ffi {
     pub type ENGINE = c_void;
 
     unsafe extern "C" {
-        pub fn ENGINE_by_id(id: *const c_char) -> *mut ENGINE;
         pub fn CONF_modules_load_file(
             filename: *const c_char,
             appname: *const c_char,
             flags: std::ffi::c_ulong,
         ) -> c_int;
-        pub fn ENGINE_init(e: *mut ENGINE) -> c_int;
-        pub fn ENGINE_set_default_string(e: *mut ENGINE, def_list: *const c_char) -> c_int;
         pub fn OBJ_txt2nid(s: *const c_char) -> c_int;
         pub fn BIO_free(b: *mut openssl_sys::BIO) -> c_int;
         pub fn EVP_PKEY_CTX_ctrl_str(
@@ -49,6 +46,43 @@ mod gost_ffi {
             keytype: *const c_char,
             value: *const c_char,
         ) -> c_int;
+    }
+
+    /// The ENGINE API entry points. OpenSSL 4.0 removed the whole API from
+    /// libcrypto, so these cannot be linked statically; they are resolved
+    /// through dlsym at runtime instead. None when the running libcrypto
+    /// has no ENGINE API — engine-based GOST is then simply unavailable
+    /// and `init_gost` falls back to the provider path.
+    pub struct EngineFns {
+        pub by_id: unsafe extern "C" fn(id: *const c_char) -> *mut ENGINE,
+        pub init: unsafe extern "C" fn(e: *mut ENGINE) -> c_int,
+        pub set_default_string: unsafe extern "C" fn(e: *mut ENGINE, def_list: *const c_char) -> c_int,
+        pub get_digest: unsafe extern "C" fn(e: *const ENGINE, nid: c_int) -> *const c_void,
+    }
+
+    pub fn engine_fns() -> Option<&'static EngineFns> {
+        static FNS: std::sync::OnceLock<Option<EngineFns>> = std::sync::OnceLock::new();
+        FNS.get_or_init(|| unsafe {
+            let sym = |name: &std::ffi::CStr| -> usize {
+                libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) as usize
+            };
+            let (by_id, init, set_default_string, get_digest) = (
+                sym(c"ENGINE_by_id"),
+                sym(c"ENGINE_init"),
+                sym(c"ENGINE_set_default_string"),
+                sym(c"ENGINE_get_digest"),
+            );
+            if by_id == 0 || init == 0 || set_default_string == 0 || get_digest == 0 {
+                return None;
+            }
+            Some(EngineFns {
+                by_id: std::mem::transmute(by_id),
+                init: std::mem::transmute(init),
+                set_default_string: std::mem::transmute(set_default_string),
+                get_digest: std::mem::transmute(get_digest),
+            })
+        })
+        .as_ref()
     }
 }
 
@@ -122,17 +156,18 @@ fn load_embedded_gost_engine(name: &std::ffi::CString) -> bool {
         }
     }
     let Some(dir) = path.parent() else { return false };
+    let Some(fns) = gost_ffi::engine_fns() else { return false };
     // SAFETY: startup path, single-threaded in practice (see the comment
     // in load_gost_engine).
     unsafe { std::env::set_var("OPENSSL_ENGINES", dir) };
     unsafe {
-        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        let e = (fns.by_id)(name.as_ptr());
         if e.is_null() {
             return false;
         }
         // Keep the engine initialized and default forever; never free.
-        let ok = gost_ffi::ENGINE_init(e) == 1
-            && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
+        let ok = (fns.init)(e) == 1
+            && (fns.set_default_string)(e, c"ALL".as_ptr()) == 1;
         if ok {
             let _ = GOST_ENGINE_PTR.set(e as usize);
             let _ = GOST_NIDS.set(resolve_gost_nids());
@@ -158,8 +193,13 @@ pub fn init_gost() -> bool {
         let e = load_gost_engine(&name);
         if !e.is_null() {
             // Keep the engine initialized and default forever; never finish/free.
-            let ok = gost_ffi::ENGINE_init(e) == 1
-                && gost_ffi::ENGINE_set_default_string(e, c"ALL".as_ptr()) == 1;
+            let ok = match gost_ffi::engine_fns() {
+                Some(fns) => {
+                    (fns.init)(e) == 1
+                        && (fns.set_default_string)(e, c"ALL".as_ptr()) == 1
+                }
+                None => false,
+            };
             if ok {
                 let _ = GOST_ENGINE_PTR.set(e as usize);
                 let _ = GOST_NIDS.set(resolve_gost_nids());
@@ -181,14 +221,26 @@ pub fn gost_engine_ptr() -> *mut std::ffi::c_void {
     gost_engine().cast()
 }
 
+/// ENGINE_get_digest resolved at runtime; NULL when the ENGINE API is
+/// absent from the running libcrypto (OpenSSL 4) or the engine is empty.
+pub(crate) fn gost_engine_digest(e: *const std::ffi::c_void, nid: i32) -> *const openssl_sys::EVP_MD {
+    match gost_ffi::engine_fns() {
+        Some(fns) => (unsafe { (fns.get_digest)(e.cast(), nid) }) as *const openssl_sys::EVP_MD,
+        None => std::ptr::null(),
+    }
+}
+
 fn gost_engine() -> *mut gost_ffi::ENGINE {
     GOST_ENGINE_PTR.get().copied().unwrap_or(0) as *mut gost_ffi::ENGINE
 }
 
 fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
+    let Some(fns) = gost_ffi::engine_fns() else {
+        return std::ptr::null_mut();
+    };
     unsafe {
     use std::ffi::CString;
-    let direct = gost_ffi::ENGINE_by_id(name.as_ptr());
+    let direct = (fns.by_id)(name.as_ptr());
     if !direct.is_null() {
         return direct;
     }
@@ -200,7 +252,7 @@ fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
         }
         let Ok(c) = CString::new(conf) else { continue };
         gost_ffi::CONF_modules_load_file(c.as_ptr(), c"openssl_conf".as_ptr(), 0);
-        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        let e = (fns.by_id)(name.as_ptr());
         if !e.is_null() {
             return e;
         }
@@ -226,7 +278,7 @@ fn load_gost_engine(name: &std::ffi::CString) -> *mut gost_ffi::ENGINE {
         // spawns anything); later calls are guarded by the OnceLock in
         // init_gost and never reach here again.
         std::env::set_var("OPENSSL_ENGINES", dir);
-        let e = gost_ffi::ENGINE_by_id(name.as_ptr());
+        let e = (fns.by_id)(name.as_ptr());
         if !e.is_null() {
             return e;
         }
